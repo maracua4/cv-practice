@@ -44,9 +44,9 @@ def antique(img): #Фильтр Антиквариат
     res=sepia(res)
     res=vignette(res)
     return res
-def fade(img, strenght = 0.5): #Фильтр выцветания
+def fade(img, strength = 0.5): #Фильтр выцветания
     white = np.ones(img.shape, dtype=np.uint8)* 255 #Создаем белый фон
-    res = cv.addWeighted(img, 1-strenght, white, strenght, 0) #Смешиваем 2 изображения
+    res = cv.addWeighted(img, 1-strength, white, strength, 0) #Смешиваем 2 изображения
     return res
 def infrared(img):
     kernel = np.array([
@@ -58,43 +58,71 @@ def infrared(img):
     return cv.convertScaleAbs(res, alpha = 1.15, beta = -10) #Увеличение контраста
 def negative(img): #Негативный фильтр - инвертирование цветов
     return 255 - img
-def matte(img):
+def matte(img, border=100):
     h, w = img.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)  # Создаем черное изображения
-    cv.ellipse(mask, (w // 2, h // 2), (w // 2, h // 2), 0, 0, 360, 255, -1)  # Рисуем белый круг по центру
+    cv.ellipse(mask, (w // 2, h // 2), (w // 2 - border, h // 2 - border), 0, 0, 360, 255, -1)  # Рисуем белый круг по центру
     mask = cv.GaussianBlur(mask, (101, 101), 0)  # Размытие
     mask = mask.astype(np.float32) / 255
     white = np.ones_like(img, dtype=np.float32)*255 #Создаем белый фон
     res = img.astype(np.float32)* mask[:, :, np.newaxis] + white * (1-mask[:, :, np.newaxis]) #Смешиваем овал и фото
     return np.clip(res, 0, 255).astype(np.uint8)
-def old(img): #Эффект состаривания
+def old(img, blur = 11, strength = 0.5): #Эффект состаривания
     h, w= img.shape[:2]
     res = cv.convertScaleAbs(img, alpha = 0.8, beta = 20)
     #Добавляем шум
     noise = np.random.normal(0, 15, (h,w,3)) #оздает случайный шум
     res = res.astype(np.float32) + noise
     res = np.clip(res, 0, 255).astype(np.uint8)
-
+    res = vignette(res)
     #Добавляем царапины
+    scratches = np.zeros_like(res)
     for i in range(30):
-        #Выбор случайных координатов
-        x=np.random.randint(0,w)
-        y=np.random.randint(0,h)
-        #Цвет и длина царапины
+        x = np.random.randint(0, w)
+        y = np.random.randint(0, h)
         color = np.random.randint(150, 230)
-        a=np.random.randint(10, h//4 +1)
-        #Рисовка царапины
-        cv.line(res,(x,y), (x+np.random.randint(-10,11), min(y+a,h-1)),(color,color,color),np.random.randint(1,3))
-    return res
+        a = np.random.randint(10, h // 4 + 1)
+        dx = np.random.randint(-a, a + 1)
+        dy = np.random.randint(-a, a + 1)
 
-def neon(img, B=255, G=0, R=255, threshold=100):
+        # Изгиб: у 60% царапин 0 (прямая), у остальных случайный
+        bend = 0
+        if np.random.rand() < 0.4:
+            bend = np.random.randint(-a // 2, a // 2 + 1)
+
+        t = np.linspace(0, 1, 30)
+        px = x + dx * t + bend * 4 * t * (1 - t)
+        py = y + dy * t
+        points = np.stack([px, py], axis=1).astype(np.int32)
+        cv.polylines(scratches, [points], False, (color, color, color), 1, cv.LINE_AA)
+
+    if blur > 0:
+        k = blur | 1  # делаем ядро нечётным
+        scratches = cv.GaussianBlur(scratches, (k, k), 0)
+    scratches = cv.convertScaleAbs(scratches, alpha = strength)
+    return cv.add(res, scratches)
+
+def neon(img, B=255, G=0, R=255, threshold=100, min_area=500, thickness=3, glow_size=15, glow_strength=1.0):
     gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY) #Перевод в серое изображение
+    gray = cv.bilateralFilter(gray, 9, 75, 75) #Гасит зернистость
     gray = cv.GaussianBlur(gray, (9, 9), 0) #Подавление шума
 
     lap = cv.Laplacian(gray, cv.CV_64F,  ksize=5) #Находим контуры оператором Лапласа
     lap = cv.convertScaleAbs(lap)
     mask = cv.threshold(lap, threshold, 255, cv.THRESH_BINARY)[1] #Создание маски контура
+    kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, (9, 9))
+    mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel)
 
+    #Удаляем мелкие "точки" (шум), оставляем только крупные связные компоненты
+    n, labels, stats, _ = cv.connectedComponentsWithStats(mask, connectivity=8)
+    clean = np.zeros_like(mask)
+    for i in range(1, n):  # 0 — это фон
+        if stats[i, cv.CC_STAT_AREA] >= min_area:
+            clean[labels == i] = 255
+    mask = clean
+
+    #Регулируем толщину линии
+    mask = cv.dilate(mask, np.ones((thickness, thickness), np.uint8))
     #Раскрашиваем контуры
     neon = cv.merge([
         (mask * (B / 255)).astype(np.uint8),
@@ -102,7 +130,9 @@ def neon(img, B=255, G=0, R=255, threshold=100):
         (mask * (R / 255)).astype(np.uint8),
     ])
 
-    glow = cv.GaussianBlur(neon, (51, 51), 20) #Объединение контуров и размытого свечения
+    k = glow_size | 1  # если передали чётное, делаем нечётным
+    glow = cv.GaussianBlur(neon, (k, k), 0)  #Объединение контуров и размытого свечения
+    glow = cv.convertScaleAbs(glow, alpha=glow_strength)  # яркость свечения
     neon = cv.add(neon, glow)
 
     #Тёмный фон + неон
@@ -150,7 +180,6 @@ def choose_filter(): #Выбор фильтра
     if not choice.isdigit():
         print("Введите число!")
         return None
-
     choice = int(choice)
     if choice not in filters:
         print("Такого фильтра нет!")
